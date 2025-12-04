@@ -1,0 +1,261 @@
+---
+- name: Install Docker
+  hosts: all
+  become: yes
+  vars:
+   docker_packages:
+    - docker-ce
+    - docker-ce-cli
+    - containerd.io
+    - docker-buildx-plugin
+    - docker-compose-plugin
+
+  tasks:
+   - name: Creating Ubuntu dependencies
+     when: ansible_distribution == "Ubuntu"
+     block:
+       - name: install dependencies only for Ubuntu
+         apt:
+           name: "{{item}}"
+           state: present
+           update_cache: yes
+         loop:
+           - apt-transport-https
+           - ca-certificates
+           - curl
+           - gnupg-agent
+           - software-properties-common
+           - fail2ban
+           - ufw
+           - unattended-upgrades
+           - apt-listchanges
+           - libpam-pwquality
+           - htop
+           - iotop
+           - nethogs
+           - ncdu
+
+       - name: add GPG key
+         apt_key:
+           url: https://download.docker.com/linux/ubuntu/gpg
+           state: present
+
+       - name: add docker repository to apt Ubuntu
+         apt_repository:
+           repo: deb https://download.docker.com/linux/ubuntu bionic stable
+           state: present
+
+       - name: install docker Ubuntu
+         apt:
+          name: "{{docker_packages}}"
+          state: latest
+          update_cache: yes
+     rescue:
+       - debug:
+           msg: "Caught a error, check dependecies for Ubuntu"
+   
+   - name: Downloading docker in CentOS
+     when: ansible_distribution == "CentOS"
+     block:
+       - name: Add Docker repository to CentOS
+         yum_repository:
+          name: docker-ce-stable
+          description: Docker CE Stable - x86_64
+          baseurl: https://download.docker.com/linux/centos/7/x86_64/stable
+          gpgcheck: yes
+          gpgkey: https://download.docker.com/linux/centos/gpg
+          enabled: yes
+
+       - name: Install git
+         yum:
+          name: git
+          state: present
+
+       - name: install docker CentOS
+         yum:
+          name: "{{docker_packages}}"
+          state: latest
+          update_cache: yes
+     rescue:
+       - debug:
+           msg: "Caught a error, check dependecies for CentOS"
+
+- name: Basic security
+  hosts: all
+  become: yes
+  tasks:
+    - name: Enable UFW firewall
+      ufw:
+        state: enabled
+        policy: deny
+    - name: Configure UFW rules
+      ufw:
+        rule: "{{ item.rule }}"
+        port: "{{ item.port }}"
+        proto: "{{ item.proto | default('tcp') }}"
+      loop:
+        - { rule: allow, port: '22', comment: 'SSH' }
+        - { rule: allow, port: '2267', comment: 'SSH2' }
+        - { rule: allow, port: '80', comment: 'HTTP' }
+        - { rule: allow, port: '443', comment: 'HTTPS' }
+    - name: Configure automatic security updates
+      copy:
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+          APT::Periodic::AutocleanInterval "7";
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+    - name: Create fail2ban filter for Nextcloud
+      copy:
+        content: |
+          [Definition]
+            failregex = ^\[.*\] \{\"reqId\":\".*\",\"remoteAddr\":\"<HOST>\",\"app\":\".*\",\"message\":\"Login failed: .*\",\"level\":2,\"time\":\".*\"\}$
+            ^\[.*\] \{\"reqId\":\".*\",\"remoteAddr\":\"<HOST>\",\"app\":\"core\",\"message\":\"Login failed: .* \(Remote IP: '<HOST>'\)\",\"level\":2,\"time\":\".*\"\}$
+            ^{"reqId":".*","remoteAddr":"<HOST>","app":"core","message":"Login failed:.*","level":2,"time":".*"}$
+        dest: /etc/fail2ban/filter.d/nextcloud.conf
+    - name: Configure fail2ban for SSH
+      copy:
+        content: |
+          [DEFAULT]
+          bantime = 3600
+          findtime = 600
+          maxretry = 3
+
+          [sshd]
+          enabled = true
+          port = 22
+          logpath = /var/log/auth.log
+          maxretry = 3
+
+          [nextcloud]
+          enabled = true
+          port = 80,443
+          protocol = tcp
+          filter = nextcloud
+          maxretry = 3
+          bantime = 86400
+          findtime = 3600
+        dest: /etc/fail2ban/jail.local
+
+    - name: Enable fail2ban
+      service:
+        name: fail2ban
+        state: started
+        enabled: yes
+    - name: Restart fail2ban
+      service:
+        name: fail2ban
+        state: restarted
+- name: Deploy Nextcloud with Redis and MariaDB
+  hosts: all
+  become: yes
+  vars_files:
+   - /home/vladislav/nextcloud/secrets.yml
+  tasks:
+    - name: Create directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ ansible_user_id }}"
+        mode: 0750
+      loop:
+        - /home/{{ansible_user}}/nextcloud/data
+        - /home/{{ansible_user}}/nextcloud/config
+        - /home/{{ansible_user}}/nextcloud/nextcloud_db_data
+
+    - name: Create docker network
+      command: docker network create nextcloud_net
+      ignore_errors: yes
+
+    - name: Create mariadb service
+      copy:
+        content: |
+         [Unit]
+         Description=mariadb
+         Requires=docker.service
+         After=docker.service
+         
+         [Service]
+         Restart=always
+         ExecStartPre=-/usr/bin/docker rm mariadb
+         ExecStart=/usr/bin/docker run \
+           --rm \
+           --network=nextcloud_net \
+           --env=MYSQL_ROOT_PASSWORD={{ db_root_password }} \
+           --env=MYSQL_PASSWORD={{ db_user_password }} \
+           --env=MYSQL_DATABASE=nextcloud \
+           --env=MYSQL_USER=nextcloud \
+           --volume=/home/{{ansible_user}}/nextcloud/nextcloud_db_data:/var/lib/mysql \
+           --name=mariadb \
+           mariadb:10.5
+         ExecStop=/usr/bin/docker stop -t 10 mariadb
+         
+         [Install]
+         WantedBy=multi-user.target
+        dest: /etc/systemd/system/mariadb.service
+        owner: root
+        mode: 0644
+
+    - name: Start mariadb
+      service: 
+        name: mariadb 
+        state: started 
+        daemon_reload: true 
+        enabled: yes
+
+
+    - name: Start Redis
+      command: >
+        docker run -d 
+        --name nextcloud-redis 
+        --network nextcloud_net 
+        --restart unless-stopped 
+        redis:alpine
+      ignore_errors: yes
+      
+    - name: Create nextcloud service
+      copy:
+        content: |
+         [Unit]
+         Description=nextcloud
+         Requires=docker.service
+         After=docker.service
+         
+         [Service]
+         Restart=always
+         ExecStartPre=-/usr/bin/docker rm nextcloud
+         ExecStart=/usr/bin/docker run \
+           --rm \
+           --publish 80:80 \
+           --network nextcloud_net \
+           --env MYSQL_HOST=mariadb \
+           --env MYSQL_DATABASE=nextcloud \
+           --env MYSQL_USER=nextcloud \
+           --env MYSQL_PASSWORD={{ db_user_password }} \
+           --user root \
+           --volume /home/{{ansible_user}}/nextcloud/data:/var/www/html/data \
+           --volume /home/{{ansible_user}}/nextcloud/config:/var/www/html/config \
+           --name nextcloud \
+           nextcloud:32-apache
+         ExecStop=/usr/bin/docker stop -t 10 nextcloud
+         
+         [Install]
+         WantedBy=multi-user.target
+        dest: /etc/systemd/system/nextcloud.service
+        owner: root
+        mode: 0644
+
+    - name: stop nextcloud
+      service: 
+        name: nextcloud 
+        state: stopped
+        daemon_reload: true 
+        enabled: yes
+
+    - name: Start nextcloud
+      service: 
+        name: nextcloud 
+        state: started
+        daemon_reload: true 
+        enabled: yes
+

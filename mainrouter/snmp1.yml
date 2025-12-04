@@ -1,0 +1,649 @@
+---
+-
+ name: Install Docker
+ hosts: all
+ become: yes
+ vars:
+  telegraf_version: "1.30"
+  vm_agent_version: "v1.108.0"
+  snmp_target: "192.168.2.1"
+  docker_packages:
+   - docker-ce
+   - docker-ce-cli
+   - containerd.io
+   - docker-buildx-plugin
+   - docker-compose-plugin
+ tasks:
+  - name: Creating Ubuntu dependencies
+    when: ansible_distribution == "Ubuntu"
+    block:
+      - name: install dependencies only for Ubuntu
+        apt:
+          name: "{{item}}"
+          state: present
+          update_cache: yes
+        loop:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg-agent
+          - software-properties-common
+
+      - name: add GPG key
+        apt_key:
+          url: https://download.docker.com/linux/ubuntu/gpg
+          state: present
+
+      - name: add docker repository to apt Ubuntu
+        apt_repository:
+          repo: deb https://download.docker.com/linux/ubuntu bionic stable
+          state: present
+
+      - name: install docker Ubuntu
+        apt:
+         name: "{{docker_packages}}"
+         state: latest
+         update_cache: yes
+    rescue:
+      - debug:
+          msg: "Caught a error, check dependecies for Ubuntu"
+  
+  - name: Downloading docker in CentOS
+    when: ansible_distribution == "CentOS"
+    block:
+      - name: Add Docker repository to CentOS
+        yum_repository:
+         name: docker-ce-stable
+         description: Docker CE Stable - x86_64
+         baseurl: https://download.docker.com/linux/centos/7/x86_64/stable
+         gpgcheck: yes
+         gpgkey: https://download.docker.com/linux/centos/gpg
+         enabled: yes
+
+      - name: Install git
+        yum:
+         name: git
+         state: present
+
+      - name: install docker CentOS
+        yum:
+         name: "{{docker_packages}}"
+         state: latest
+         update_cache: yes
+    rescue:
+      - debug:
+          msg: "Caught a error, check dependecies for CentOS"
+
+- name: Deploy Telegraf SNMP to Prometheus
+  hosts: all
+  become: yes
+  tasks:
+    - name: Create MIBs directory
+      file:
+        path: "/home/{{ ansible_user }}/mibs"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Create telegraf directory
+      file:
+       path: "/home/{{ansible_user}}/telegraf"
+       state: directory
+       owner: "{{ansible_user}}"
+       group: "{{ansible_user}}"
+
+    - name: Download other Extreme MIBs
+      get_url:
+       url: "https://raw.githubusercontent.com/librenms/librenms/refs/heads/master/mibs/{{ item }}"
+       dest: "/home/{{ ansible_user }}/telegraf/snmp/mibs/{{ item }}"
+      loop:
+       - "IF-MIB"
+       - "IP-MIB"
+       - "TCP-MIB"
+       - "UDP-MIB"
+       - "SNMPv2-MIB"
+       - "SNMPv2-SMI"
+       - "SNMPv2-TC"
+       - "IANAifType-MIB"
+       - "INET-ADDRESS-MIB"
+    - name: Download Extreme MIBs
+      block:
+        - name: Download other Extreme MIBs
+          get_url:
+           url: "https://raw.githubusercontent.com/librenms/librenms/refs/heads/master/mibs/extreme/{{ item }}"
+           dest: "/home/{{ ansible_user }}/telegraf/snmp/mibs/{{ item }}"
+          loop:
+           - "EXTREME-SOFTWARE-MONITOR-MIB"
+           - "EXTREME-SERVICES-MIB"
+           - "EXTREME-PORT-MIB"
+           - "EXTREME-BASE-MIB"
+           - "EXTREME-CABLE-MIB"
+           - "EXTREME-DLCS-MIB"
+           - "EXTREME-DOS-MIB"
+           - "EXTREME-EAPS-MIB"
+           - "EXTREME-EDP-MIB"
+           - "EXTREME-ENH-DOS-MIB"
+           - "EXTREME-ENTITY-MIB"
+           - "EXTREME-ESRP-MIB"
+           - "EXTREME-FDB-MIB"
+           - "EXTREME-FILETRANSFER-MIB"
+           - "EXTREME-NETFLOW-MIB"
+           - "EXTREME-NP-MIB"
+           - "EXTREME-OSPF-MIB"
+           - "EXTREME-PBQOS-MIB"
+           - "EXTREME-POE-MIB"
+           - "EXTREME-PORT-MIB"
+           - "EXTREME-POS-MIB"
+           - "EXTREME-QOS-MIB"
+           - "EXTREME-RTSTATS-MIB"
+           - "EXTREME-SERVICES-MIB"
+           - "EXTREME-SLB-MIB"
+           - "EXTREME-SNMPV3-MIB"
+           - "EXTREME-STACKING-MIB"
+           - "EXTREME-STP-EXTENSIONS-MIB"
+           - "EXTREME-SYSTEM-MIB"
+           - "EXTREME-TRAPPOLL-MIB"
+           - "EXTREME-V2TRAP-MIB"
+           - "EXTREME-VC-MIB"
+           - "EXTREME-VLAN-MIB"
+           - "EXTREME-WIRELESS-MIB"
+           - "EXTREMEDOT11AP-MIB"
+           - "EXTREMEDOT11F-MIB"
+           - "HA-MIB"
+           - "SWBASE-MIB"
+           - "SYSTEM-MIB"
+      rescue:
+        - name: Skip if MIBs not found
+          debug:
+            msg: "Some MIBs not found, continuing with available ones"
+          
+    - name: Create ultimate Telegraf config
+      copy:
+        content: |
+          [agent]
+            interval = "30s"
+            flush_interval = "30s"
+
+          [[outputs.prometheus_client]]
+            listen = ":9125"
+            metric_version = 2
+            export_timestamp = false
+
+          [[processors.converter]]
+            namepass = ["memory_system"]
+            [processors.converter.fields]
+              integer = ["total_kb", "free_kb", "system_usage_kb", "user_usage_kb"]
+
+          [[inputs.snmp]]
+            agents = ["udp://{{snmp_target}}:161"]
+            version = 2
+            community = "public"
+            timeout = "10s"
+            retries = 3
+            path = ["/usr/share/snmp/mibs", "/etc/telegraf/mibs"]
+            
+            [[inputs.snmp.field]]
+              name = "sysDescr"
+              oid = "1.3.6.1.2.1.1.1.0"
+              is_tag = true
+            
+            [[inputs.snmp.field]]
+              name = "sysUpTime"
+              oid = "1.3.6.1.2.1.1.3.0"
+            
+            [[inputs.snmp.field]]
+              name = "sysName"
+              oid = "1.3.6.1.2.1.1.5.0"
+              is_tag = true
+
+            [[inputs.snmp.field]]
+              name = "cpu_total_usage"
+              oid = "EXTREME-SOFTWARE-MONITOR-MIB::extremeCpuMonitorTotalUtilization.0"
+
+            [[inputs.snmp.table]]
+              name = "cpu_system"
+              oid = "EXTREME-SOFTWARE-MONITOR-MIB::extremeCpuMonitorSystemTable"
+              
+              [[inputs.snmp.table.field]]
+                name = "slot_id"
+                oid = "EXTREME-SOFTWARE-MONITOR-MIB::extremeCpuMonitorSystemSlotId"
+                is_tag = true
+              
+              [[inputs.snmp.table.field]]
+                name = "cpu_5sec"
+                oid = "EXTREME-SOFTWARE-MONITOR-MIB::extremeCpuMonitorSystemUtilization5secs"
+              
+              [[inputs.snmp.table.field]]
+                name = "cpu_1min"
+                oid = "EXTREME-SOFTWARE-MONITOR-MIB::extremeCpuMonitorSystemUtilization1min"
+
+            [[inputs.snmp.table]]
+              name = "memory_system"
+              oid = "EXTREME-SOFTWARE-MONITOR-MIB::extremeMemoryMonitorSystemTable"
+              
+              [[inputs.snmp.table.field]]
+                name = "slot_id"
+                oid = "EXTREME-SOFTWARE-MONITOR-MIB::extremeMemoryMonitorSystemSlotId"
+                is_tag = true
+              
+              [[inputs.snmp.table.field]]
+                name = "total_kb"
+                oid = "EXTREME-SOFTWARE-MONITOR-MIB::extremeMemoryMonitorSystemTotal"
+              
+              [[inputs.snmp.table.field]]
+                name = "free_kb"
+                oid = "EXTREME-SOFTWARE-MONITOR-MIB::extremeMemoryMonitorSystemFree"
+              
+              [[inputs.snmp.table.field]]
+                name = "system_usage_kb"
+                oid = "EXTREME-SOFTWARE-MONITOR-MIB::extremeMemoryMonitorSystemUsage"
+              
+              [[inputs.snmp.table.field]]
+                name = "user_usage_kb"
+                oid = "EXTREME-SOFTWARE-MONITOR-MIB::extremeMemoryMonitorUserUsage"
+
+            [[inputs.snmp.field]]
+              name = "temperature"
+              oid = "EXTREME-SYSTEM-MIB::extremeCurrentTemperature.0"
+
+            [[inputs.snmp.field]]
+              name = "over_temperature_alarm"
+              oid = "EXTREME-SYSTEM-MIB::extremeOverTemperatureAlarm.0"
+
+            [[inputs.snmp.field]]
+              name = "power_usage"
+              oid = "EXTREME-SYSTEM-MIB::extremeSystemPowerUsageValue.0"
+
+            [[inputs.snmp.field]]
+              name = "power_state"
+              oid = "EXTREME-SYSTEM-MIB::extremeSystemPowerState.0"
+
+            [[inputs.snmp.table]]
+              name = "fans"
+              oid = "EXTREME-SYSTEM-MIB::extremeFanStatusTable"
+              
+              [[inputs.snmp.table.field]]
+                name = "fan_number"
+                oid = "EXTREME-SYSTEM-MIB::extremeFanNumber"
+                is_tag = true
+              
+              [[inputs.snmp.table.field]]
+                name = "operational"
+                oid = "EXTREME-SYSTEM-MIB::extremeFanOperational"
+              
+              [[inputs.snmp.table.field]]
+                name = "speed"
+                oid = "EXTREME-SYSTEM-MIB::extremeFanSpeed"
+
+            [[inputs.snmp.table]]
+              name = "power_supplies"
+              oid = "EXTREME-SYSTEM-MIB::extremePowerSupplyTable"
+              
+              [[inputs.snmp.table.field]]
+                name = "psu_number"
+                oid = "EXTREME-SYSTEM-MIB::extremePowerSupplyNumber"
+                is_tag = true
+              
+              [[inputs.snmp.table.field]]
+                name = "status"
+                oid = "EXTREME-SYSTEM-MIB::extremePowerSupplyStatus"
+              
+              [[inputs.snmp.table.field]]
+                name = "input_voltage"
+                oid = "EXTREME-SYSTEM-MIB::extremePowerSupplyInputVoltage"
+
+            [[inputs.snmp.field]]
+              name = "temp_101"
+              oid = "1.3.6.1.4.1.1916.1.1.1.8.0"
+
+            [[inputs.snmp.field]]
+              name = "fan_101"
+              oid = "1.3.6.1.4.1.1916.1.1.1.9.1.4.101"
+
+            [[inputs.snmp.field]]
+              name = "fan_102"
+              oid = "1.3.6.1.4.1.1916.1.1.1.9.1.4.102"
+
+            [[inputs.snmp.table]]
+              name = "interface"
+              oid = "IF-MIB::ifTable"
+
+              [[inputs.snmp.table.field]]
+                name = "if_index"
+                oid = "IF-MIB::ifIndex"
+                is_tag = true
+              
+              [[inputs.snmp.table.field]]
+                name = "if_descr"
+                oid = "IF-MIB::ifDescr"
+                is_tag = true
+              
+              [[inputs.snmp.table.field]]
+                name = "if_oper_status"
+                oid = "IF-MIB::ifOperStatus"
+              
+              [[inputs.snmp.table.field]]
+                name = "if_in_octets"
+                oid = "IF-MIB::ifInOctets"
+              
+              [[inputs.snmp.table.field]]
+                name = "if_out_octets"
+                oid = "IF-MIB::ifOutOctets"
+
+        dest: "/home/{{ ansible_user }}/telegraf.conf"
+
+    - name: Stop old containers
+      docker_container:
+        name: telegraf-snmp
+        state: absent
+
+    - name: Use standard Telegraf and mount MIBs
+      docker_container:
+        name: telegraf-extreme
+        image: telegraf:1.30
+        state: started
+        restart_policy: always
+        ports:
+          - "9125:9125"
+        volumes:
+          - "/home/{{ ansible_user }}/telegraf.conf:/etc/telegraf/telegraf.conf"
+          -  /home/{{ ansible_user }}/telegraf/snmp/mibs:/etc/telegraf/.snmp/mibs:ro
+          - /home/{{ ansible_user }}/telegraf/snmp/mibs:/usr/share/snmp/mibs
+
+    - name: Wait for Telegraf to start
+      wait_for:
+        port: 9125
+        host: "{{ansible_host}}"
+        timeout: 30
+
+    - name: Test Telegraf metrics
+      uri:
+        url: "http://{{ansible_host}}/metrics"
+        return_content: yes
+      register: telegraf_metrics
+      failed_when: false
+
+    - name: Show metrics result
+      debug:
+        var: telegraf_metrics.content
+
+
+- name: Install prometheus core
+  hosts: all
+  become: yes
+  vars:
+   prometheus_snmp_jobs:
+  # MikroTik Router
+   - name: 'mikrotik-router'
+     exporter_host: 'localhost'
+     target: '192.168.1.1'
+     module: 'mikrotik'
+     community: 'public'
+  
+  # Cisco Switch  
+   - name: 'cisco-switch'
+     exporter_host: 'localhost' 
+     target: '192.168.2.1'
+     module: 'if_mib'
+     community: 'public'
+  
+  # HP Switch
+   - name: 'hp-switch'
+     exporter_host: 'localhost'
+     target: '192.168.1.3'
+     module: 'if_mib'
+     community: 'public'
+  
+  # Ubiquiti
+   - name: 'ubiquiti-ap'
+     exporter_host: 'localhost'
+     target: '192.168.1.4'
+     module: 'if_mib'
+     community: 'public'
+
+  tasks:
+   - name: Prometheus setup user
+     user:
+      name: prometheus
+      create_home: no
+      uid: 1101
+      shell: /bin/false
+
+   - name: Create directory rule and data
+     file: 
+      path: "{{item}}"
+      state: directory
+      owner: prometheus
+      group: prometheus
+      mode: '0755'
+     loop:
+      - /etc/prometheus
+      - /etc/prometheus/rule_files
+      - /data/prometheus
+
+
+   - name: Add SNMP jobs to Prometheus config
+     copy: 
+      content: |
+          global:
+            scrape_interval: 30s
+
+          scrape_configs:
+            - job_name: 'prometheus'
+              static_configs:
+                - targets: ['{{ansible_host}}:9090']          
+            - job_name: 'expert_switch'
+              static_configs:
+                - targets: ['{{ansible_host}}:9125']
+              metrics_path: /metrics
+              metric_relabel_configs:
+                - source_labels: [__name__]
+                  action: keep
+      dest: "/etc/prometheus/prometheus.yml"
+      owner: "{{ ansible_user }}"
+      group: "{{ ansible_user }}"
+
+   - name: Check directory
+     file:
+       path: "{{ item }}"
+       state: directory
+       owner: prometheus
+       group: prometheus
+       mode: '0755'
+     loop:
+      - /etc/prometheus
+      - /data/prometheus
+      - /etc/prometheus/rule_files
+
+   - name:  Create prometheus service
+     copy:
+      content: |
+       [Unit]
+       Description=prometheus
+       Requires=docker.service
+       After=docker.service
+      
+       [Service]
+       Restart=always
+       TimeoutStartSec=300
+       ExecStartPre=-/usr/bin/docker rm prometheus
+       ExecStart=/usr/bin/docker run \
+       --rm \
+       --user=1101 \
+       --publish=9090:9090 \
+       --memory=1024m \
+       --volume=/etc/prometheus/:/etc/prometheus/:ro \
+       --volume=/data/prometheus/:/prometheus/ \
+       --name=prometheus \
+       prom/prometheus:v2.30.3 \
+       --config.file=/etc/prometheus/prometheus.yml \
+       --storage.tsdb.path=/prometheus \
+       --storage.tsdb.retention.time=14d
+       ExecStop=/usr/bin/docker stop -t 10 prometheus
+      
+       [Install]
+       WantedBy=multi-user.target
+      dest: /etc/systemd/system/prometheus.service
+      owner: root
+      mode: 0644
+
+   - name: Start prometheus
+     service: name=prometheus state=started daemon_reload=true enabled=yes
+
+   - name: Prometheus health check
+     block:
+     - name: Wait 1 start
+       wait_for:
+        timeout: 15
+
+     - name: Check prometheus status
+       command: systemctl is-active prometheus
+       register: promstat
+       ignore_errors: yes
+       changed_when: false
+       
+     - name: Restart prometheusik
+       when: promstat.rc != 0
+       systemd: name=prometheus state=restarted
+
+     - name: Final status check prometheus
+       command: systemctl is-active prometheus
+       register: fsprom
+       changed_when: false
+       ignore_errors: no
+       failed_when: fsprom.rc !=0
+
+     rescue:
+     - fail:
+        msg: "Prometheus startup failed, its critical, check logs with: journalctl -u prometheus -n 50"
+        
+   - name: Grafana setup user
+     user:
+      name: grafana
+      create_home: no
+      uid: 1102
+      shell: /bin/false
+
+   - name: Create datasources
+     file:
+      path: "{{item}}"
+      state: directory
+      owner: grafana
+      mode: 0755
+     loop:
+      - /etc/grafana/provisioning/datasources
+      - /etc/grafana/provisioning/dashboards
+      - /data/grafana/dashboards
+
+   - name: Create config datasources
+     copy:
+      content: |
+       apiVersion: 1
+ 
+       datasources:
+         - name: Prometheus
+           type: prometheus
+           version: 1
+           access: proxy
+           orgId: 1
+           basicAuth: false
+           editable: false
+           url: http://{{ansible_host}}:9090
+      dest: /etc/grafana/provisioning/datasources/main.yml
+      owner: grafana
+      mode: 0644
+
+   - name: Create file about dashboards
+     copy:
+      content: |
+       apiVersion: 1
+ 
+       providers:
+       - name: 'main'
+         orgId: 1
+         folder: ''
+         type: file
+         disableDeletion: false
+         editable: True
+         options:
+           path: /var/lib/grafana/dashboards
+      dest: /etc/grafana/provisioning/dashboards/main.yml
+      owner: grafana
+      mode: 0644
+
+   - name: Download dashboard for node exporter and blackbox
+     git:
+      repo: https://github.com/solodium19/grafana
+      dest: ~/grafana
+   - name: Copy files exporter
+     copy:
+      src: ~/grafana/{{item}}.json
+      dest: /data/grafana/dashboards/{{item}}.json
+      owner: grafana
+      mode: 0644
+      remote_src: yes
+     loop:
+      - main-router
+
+   - name: Service file for grafana
+     copy:
+      content: |
+       [Unit]
+       Description=grafana
+       Requires=docker.service
+       After=docker.service
+      
+       [Service]
+       Restart=always
+       ExecStartPre=-/usr/bin/docker rm grafana
+       ExecStart=/usr/bin/docker run \
+         --rm \
+         --user=1102 \
+         --publish=3000:3000 \
+         --memory=1024m \
+         --volume=/etc/grafana/provisioning:/etc/grafana/provisioning \
+         --volume=/data/grafana:/var/lib/grafana \
+         --name=grafana \
+         grafana/grafana-enterprise
+       ExecStop=/usr/bin/docker stop -t 10 grafana
+      
+       [Install]
+       WantedBy=multi-user.target
+      dest: /etc/systemd/system/grafana.service
+      owner: root
+      mode: 0644
+
+   - name: Start grafana
+     service: name=grafana state=started daemon_reload=true enabled=yes
+
+   - name: Waiting for WakeUP grafana
+     wait_for:
+      timeout: 60
+
+   - name: Grafana health check
+     block:
+     - name: Check grafana status
+       command: systemctl is-active grafana
+       register: grafstat
+       ignore_errors: no
+       changed_when: false
+
+     - name: Restart grafanka
+       when: grafstat.rc != 0
+       systemd: name=grafana state=restarted
+
+     - name: Wait for grafana to start
+       wait_for:
+         port: 3000
+         host: {{ansible_host}}
+         timeout: 15
+
+     - name: Final status check grafana
+       command: systemctl is-active grafana
+       register: fsgraf
+       failed_when: fsgraf.rc != 0
+       changed_when: false
+
+     rescue:
+     - fail:
+        msg: "grafana startup failed, check logs with: journalctl -u grafana -n 50"

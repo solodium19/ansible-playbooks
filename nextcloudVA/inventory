@@ -1,0 +1,1 @@
+host ansible_host=192.168.2.212 ansible_connection=ssh ansible_user=adminva ansible_ssh_private_key_file=~/.ssh/nextcloud_key ansible_sudo_pass=35bg3JzQNE4uS7A

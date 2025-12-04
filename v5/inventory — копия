@@ -1,0 +1,26 @@
+#core ansible_host=158.160.187.161 ansible_connection=ssh ansible_user=vladadmin ansible_ssh_private_key_file=/home/vladislav/.ssh/ssh-key-1758526672546
+#link ansible_host=158.160.200.109 ansible_connection=ssh ansible_user=vladadmin ansible_ssh_private_key_file=/home/vladislav/.ssh/ssh-key-1758526672546
+
+all:
+  children:
+    prometheus_servers:
+      hosts:
+        core:
+         ansible_host: 51.250.35.244
+         ansible_ssh_private_key_file: /home/vladislav/.ssh/ssh-key-1758526672546
+         ansible_user: vladadmin
+    
+    monitored_hosts:
+      hosts:
+        node:
+         ansible_host: 158.160.203.138
+         ansible_ssh_private_key_file: /home/vladislav/.ssh/ssh-key-1758526672546
+         ansible_user: vladadmin
+        blackbox:
+         ansible_host: 158.160.160.147
+         ansible_ssh_private_key_file: /home/vladislav/.ssh/ssh-key-1758526672546
+         ansible_user: vladadmin
+        #web01:
+         # ansible_host: 192.168.1.21
+       # db01:
+         # ansible_host: 192.168.1.22

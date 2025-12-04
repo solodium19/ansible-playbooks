@@ -1,0 +1,520 @@
+---
+-
+ name: Install Docker
+ hosts: all
+ become: yes
+ vars:
+  docker_packages:
+   - docker-ce
+   - docker-ce-cli
+   - containerd.io
+   - docker-buildx-plugin
+   - docker-compose-plugin
+
+ tasks:
+  - name: Creating Ubuntu dependencies
+    when: ansible_distribution == "Ubuntu"
+    block:
+      - name: install dependencies only for Ubuntu
+        apt:
+          name: "{{item}}"
+          state: present
+          update_cache: yes
+        loop:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg-agent
+          - software-properties-common
+
+      - name: add GPG key
+        apt_key:
+          url: https://download.docker.com/linux/ubuntu/gpg
+          state: present
+
+      - name: add docker repository to apt Ubuntu
+        apt_repository:
+          repo: deb https://download.docker.com/linux/ubuntu bionic stable
+          state: present
+
+      - name: install docker Ubuntu
+        apt:
+         name: "{{docker_packages}}"
+         state: latest
+         update_cache: yes
+    rescue:
+      - debug:
+          msg: "Caught a error, check dependecies for Ubuntu"
+  
+  - name: Downloading docker in CentOS
+    when: ansible_distribution == "CentOS"
+    block:
+      - name: Add Docker repository to CentOS
+        yum_repository:
+         name: docker-ce-stable
+         description: Docker CE Stable - x86_64
+         baseurl: https://download.docker.com/linux/centos/7/x86_64/stable
+         gpgcheck: yes
+         gpgkey: https://download.docker.com/linux/centos/gpg
+         enabled: yes
+
+      - name: Install git
+        yum:
+         name: git
+         state: present
+
+      - name: install docker CentOS
+        yum:
+         name: "{{docker_packages}}"
+         state: latest
+         update_cache: yes
+    rescue:
+      - debug:
+          msg: "Caught a error, check dependecies for CentOS"
+
+
+
+- name: Install monitored hosts
+  hosts: monitored_hosts
+  become: yes
+  tasks:
+   - name: Download node Exporter
+     copy:
+      content: |
+        [Unit]
+        Description=node exporter
+        Requires=docker.service
+        After=docker.service
+        
+        [Service]
+        Restart=always
+        ExecStartPre=-/usr/bin/docker rm node-exporter
+        ExecStart=/usr/bin/docker run \
+          --rm \
+          --publish=9100:9100 \
+          --memory=64m \
+          --volume=/proc:/host/proc:ro \
+          --volume=/sys:/host/sys:ro \
+          --volume=/:/rootfs:ro \
+          --name=node-exporter \
+          prom/node-exporter:v1.1.2
+        ExecStop=/usr/bin/docker stop -t 10 node-exporter
+        
+        [Install]
+        WantedBy=multi-user.target
+      dest: /etc/systemd/system/node-exporter.service
+      owner: root
+      mode: 0644
+
+   - name: Download cadvisor Exporter
+     when: inventory_hostname == "node"
+     copy:
+      content: |
+       [Unit]
+       Description=cadvisor
+       Requires=docker.service
+       After=docker.service
+      
+       [Service]
+       Restart=always
+       ExecStartPre=-/usr/bin/docker rm cadvisor
+       ExecStart=/usr/bin/docker run \
+       --rm \
+       --publish=8080:8080 \
+       --volume=/:/rootfs:ro \
+       --volume=/var/run:/var/run:ro \
+       --volume=/sys:/sys:ro \
+       --volume=/var/lib/docker/:/var/lib/docker:ro \
+       --volume=/dev/disk/:/dev/disk:ro \
+       --privileged=true \
+       --name=cadvisor \
+       gcr.io/cadvisor/cadvisor:v0.44.0
+      
+       ExecStop=/usr/bin/docker stop -t 10 cadvisor
+      
+       [Install]
+       WantedBy=multi-user.target
+      dest: /etc/systemd/system/cadvisor.service
+      owner: root
+      mode: 0644
+
+   - name: Start Exporters for node
+     when: inventory_hostname == "node"
+     service: name={{item}} state=started daemon_reload=true enabled=yes
+     loop:
+     - node-exporter
+     - cadvisor
+
+   - name: Blackbox only
+     when: inventory_hostname == "blackbox"
+     block:
+      - name: Download blackbox Exporter
+        copy:
+          content: |
+            [Unit]
+            Description=blackbox exporter
+            Requires=docker.service
+            After=docker.service
+            
+            [Service]
+            Restart=always
+            ExecStartPre=-/usr/bin/docker rm blackbox-exporter
+            ExecStart=/usr/bin/docker run \
+              --rm \
+              --publish=9115:9115 \
+              --memory=64m \
+              --name=blackbox-exporter \
+              prom/blackbox-exporter:v0.22.0
+            ExecStop=/usr/bin/docker stop -t 10 blackbox-exporter
+          
+            [Install]
+            WantedBy=multi-user.target
+          dest: /etc/systemd/system/blackbox-exporter.service
+          owner: root
+          group: root
+          mode: 0644
+
+      - name: Reload systemd and enable blackbox
+        systemd:
+          name: '{{item}}'
+          daemon_reload: yes
+          enabled: yes
+          state: started
+        loop:
+          - node-exporter
+          - blackbox-exporter
+
+     rescue:
+      - debug:
+         msg: "It`s only for users with BB:)"
+
+   - name: Wait 15 sec for start docker containerd
+     wait_for:
+      timeout: 15
+      delay: 5
+  
+   - name: Restart exporters if then down node
+     when: inventory_hostname == "node"
+     block:
+      - name: Check Exporters for node
+        when: inventory_hostname == "node"
+        command: systemctl is-active {{ item }}
+        register: nodecheck
+        ignore_errors: no
+        changed_when: false
+        loop:
+        - node-exporter
+        - cadvisor
+
+      - name: Restart all exporters node
+        command: systemctl restart {{ item.item }}
+        loop: "{{ nodecheck.results }}"
+        when: item.rc != 0
+        loop_control:
+         label: "{{ item.item }}"
+
+      - name: Wait 15 sec to restart node
+        when: item.rc != 0
+        loop: "{{ nodecheck.results }}"
+        wait_for:
+         timeout: 15
+
+      - name: Last check node
+        command: systemctl is-active {{item}}
+        register: lcnode
+        failed_when: lcnode.rc != 0
+        loop:
+         - node-exporter
+         - cadvisor
+     rescue:
+      - debug:
+         msg: "Any exporter node down its not critical, check logs journalctl -u Node -n 50"
+
+   - name: Restart exporters if then down blackbox
+     when: inventory_hostname == "blackbox"
+     block:
+      - name: Check Exporters for blackbox
+        when: inventory_hostname == "blackbox"
+        command: systemctl is-active {{item}}
+        register: blackboxcheck
+        changed_when: false
+        loop:
+         - node-exporter
+         - blackbox-exporter
+      - name: Restart all exporters blackbox
+        command: systemctl restart {{ item.item }}
+        loop: "{{ blackboxcheck.results }}"
+        when: item.rc != 0
+        loop_control:
+         label: "{{item.item}}"
+      - name: Wait restarting blackbox containers
+        wait_for:
+         timeout: 15
+      - name: Last check blackbox
+        command: systemctl is-active {{item}}
+        register: lbcheck
+        changed_when: false
+        ignore_errors: no
+        loop:
+         - node-exporter
+         - blackbox-exporter
+     rescue:
+      - debug:
+         msg: "Any exporter Blackbox down its not critical, check logs journalctl -u blackbox -n 50"
+
+
+
+
+- name: Install prometheus core
+  hosts: prometheus_servers
+  become: yes
+  vars:
+   prometheus_scrape_jobs:
+   - name: 'node_exporter'
+     host_group: 'monitored_hosts'
+     port: 9100
+  
+   - name: 'cadvisor'
+     host_group: 'monitored_hosts'
+     port: 8080
+
+   datasources_jobs:
+   - name: "main"
+     host_group: "prometheus_servers"
+     port: 9090
+
+   prometheus_blackbox_jobs:
+   - name: 'blackbox-exporter' 
+     host_group: 'monitored_hosts'
+     blackbox_target: 'blackbox'
+
+  tasks:
+   - name: Prometheus setup user
+     user:
+      name: prometheus
+      create_home: no
+      uid: 1101
+      shell: /bin/false
+
+   - name: Create directory rule and data
+     file: 
+      path: "{{item}}"
+      state: directory
+      owner: prometheus
+      group: prometheus
+      mode: '0755'
+     loop:
+      - /etc/prometheus
+      - /etc/prometheus/rule_files
+      - /data/prometheus
+
+   - name: Создаем динамический конфиг Prometheus
+     template:
+      src: prometheus.yml.j2
+      dest: /etc/prometheus/prometheus.yml
+      owner: prometheus
+      mode: 0644
+
+   - name: Check directory
+     file:
+       path: "{{ item }}"
+       state: directory
+       owner: prometheus
+       group: prometheus
+       mode: '0755'
+     loop:
+      - /etc/prometheus
+      - /data/prometheus
+      - /etc/prometheus/rule_files
+
+   - name:  Create prometheus service
+     copy:
+      content: |
+       [Unit]
+       Description=prometheus
+       Requires=docker.service
+       After=docker.service
+      
+       [Service]
+       Restart=always
+       TimeoutStartSec=300
+       ExecStartPre=-/usr/bin/docker rm prometheus
+       ExecStart=/usr/bin/docker run \
+       --rm \
+       --user=1101 \
+       --publish=9090:9090 \
+       --memory=1024m \
+       --volume=/etc/prometheus/:/etc/prometheus/:ro \
+       --volume=/data/prometheus/:/prometheus/ \
+       --name=prometheus \
+       prom/prometheus:v2.30.3 \
+       --config.file=/etc/prometheus/prometheus.yml \
+       --storage.tsdb.path=/prometheus \
+       --storage.tsdb.retention.time=14d
+       ExecStop=/usr/bin/docker stop -t 10 prometheus
+      
+       [Install]
+       WantedBy=multi-user.target
+      dest: /etc/systemd/system/prometheus.service
+      owner: root
+      mode: 0644
+
+   - name: Start prometheus
+     service: name=prometheus state=started daemon_reload=true enabled=yes
+
+   - name: Prometheus health check
+     block:
+     - name: Wait 1 start
+       wait_for:
+        timeout: 15
+
+     - name: Check prometheus status
+       command: systemctl is-active prometheus
+       register: promstat
+       ignore_errors: no
+       changed_when: false
+       
+     - name: Restart prometheusik
+       when: promstat.rc != 0
+       systemd: name=prometheus state=restarted
+
+     - name: Wait for prometheus to start
+       wait_for:
+         port: 9090
+         host: localhost
+         timeout: 15
+
+     - name: Final status check prometheus
+       command: systemctl is-active prometheus
+       register: fsprom
+       changed_when: false
+       ignore_errors: no
+       failed_when: fsprom.rc !=0
+
+     rescue:
+     - fail:
+        msg: "Prometheus startup failed, its critical, check logs with: journalctl -u prometheus -n 50"
+        
+
+
+   - name: Grafana setup user
+     user:
+      name: grafana
+      create_home: no
+      uid: 1102
+      shell: /bin/false
+
+   - name: Create datasources
+     file:
+      path: "{{item}}"
+      state: directory
+      owner: grafana
+      mode: 0755
+     loop:
+      - /etc/grafana/provisioning/datasources
+      - /etc/grafana/provisioning/dashboards
+      - /data/grafana/dashboards
+
+   - name: Создаем динамический конфиг datasources
+     template:
+      src: datasources.yml.j2
+      dest: /etc/grafana/provisioning/datasources/main.yml
+      owner: grafana
+      mode: 0644
+
+   - name: Create file about dashboards
+     copy:
+      content: |
+       apiVersion: 1
+ 
+       providers:
+       - name: 'main'
+         orgId: 1
+         folder: ''
+         type: file
+         disableDeletion: false
+         editable: True
+         options:
+           path: /var/lib/grafana/dashboards
+      dest: /etc/grafana/provisioning/dashboards/main.yml
+      owner: grafana
+      mode: 0644
+
+   - name: Download dashboard for node exporter and blackbox
+     git:
+      repo: https://github.com/solodium19/grafana
+      dest: ~/grafana
+   - name: Copy files exporter
+     copy:
+      src: ~/grafana/{{item}}.json
+      dest: /data/grafana/dashboards/{{item}}.json
+      owner: grafana
+      mode: 0644
+      remote_src: yes
+     loop:
+      - Prometheus cadvisor
+      - blackbox-exporter
+      - node-exporter
+
+   - name: Service file for grafana
+     copy:
+      content: |
+       [Unit]
+       Description=grafana
+       Requires=docker.service
+       After=docker.service
+      
+       [Service]
+       Restart=always
+       ExecStartPre=-/usr/bin/docker rm grafana
+       ExecStart=/usr/bin/docker run \
+         --rm \
+         --user=1102 \
+         --publish=3000:3000 \
+         --memory=1024m \
+         --volume=/etc/grafana/provisioning:/etc/grafana/provisioning \
+         --volume=/data/grafana:/var/lib/grafana \
+         --name=grafana \
+         grafana/grafana-enterprise
+       ExecStop=/usr/bin/docker stop -t 10 grafana
+      
+       [Install]
+       WantedBy=multi-user.target
+      dest: /etc/systemd/system/grafana.service
+      owner: root
+      mode: 0644
+
+   - name: Start grafana
+     service: name=grafana state=started daemon_reload=true enabled=yes
+
+   - name: Waiting for WakeUP grafana
+     wait_for:
+      timeout: 60
+
+   - name: Grafana health check
+     block:
+     - name: Check grafana status
+       command: systemctl is-active grafana
+       register: grafstat
+       ignore_errors: no
+       changed_when: false
+
+     - name: Restart grafanka
+       when: grafstat.rc != 0
+       systemd: name=grafana state=restarted
+
+     - name: Wait for grafana to start
+       wait_for:
+         port: 3000
+         host: localhost
+         timeout: 15
+
+     - name: Final status check grafana
+       command: systemctl is-active grafana
+       register: fsgraf
+       failed_when: fsgraf.rc != 0
+       changed_when: false
+
+     rescue:
+     - fail:
+        msg: "grafana startup failed, check logs with: journalctl -u grafana -n 50"

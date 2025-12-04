@@ -1,0 +1,57 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+{{ '' }}
+{% for job in prometheus_scrape_jobs %}
+  - job_name: '{{ job.name }}'
+    static_configs:
+      - targets:
+        {% for host in groups[job.host_group] %}
+        - '{{ hostvars[host]["ansible_default_ipv4"]["address"] }}:{{ job.port }}'
+        {% endfor %}
+{{ '' }}
+{% endfor %}
+{% for job in prometheus_blackbox_jobs %}
+  - job_name: '{{ job.name }}'
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+        - https://google.com
+        - https://github.com
+        - http://ya.ru
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: '{{ hostvars[job.blackbox_target]["ansible_default_ipv4"]["address"] }}:9115'
+{{ '' }}
+{% endfor %}
+{% for job in prometheus_blackbox_jobs %}
+  - job_name: '{{ job.name }}'
+    metrics_path: /probe
+    params:
+      module: [tcp_connect]
+    static_configs:
+      - targets:
+        - https://google.com:443
+        - https://github.com:443
+        - http://ya.ru:443
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: '{{ hostvars[job.blackbox_target]["ansible_default_ipv4"]["address"] }}:9115'
+{{ '' }}
+{% endfor %}
